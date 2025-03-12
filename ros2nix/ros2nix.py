@@ -17,7 +17,9 @@ import sys
 from contextlib import contextmanager
 from pathlib import Path
 from textwrap import dedent, indent
-from typing import Iterable, Set, List
+from typing import Iterable, Set, List, Dict, Optional, Union
+from dataclasses import dataclass
+
 
 from catkin_pkg.package import Package, parse_package_string
 from superflore.exceptions import UnresolvedDependency
@@ -277,6 +279,17 @@ def generate_flake(args):
 
 def comma_separated(arg: str) -> list[str]:
     return [i.strip() for i in arg.split(",")]
+@dataclass
+class Fetcher:
+    regex : str
+    src_param: Optional[str]
+    fetcher: str
+    matched_attributes: List[str]
+    retrieved_attributes: List[str]
+    fixed_attributes: Dict[str, Union[str, bool, int, float]]
+    support_sparse_checkout: bool
+    source_has_name: bool
+
 
 
 def strip_empty_lines(text: str) -> str:
@@ -330,6 +343,12 @@ def ros2nix(args):
         help="When using --fetch, fetch only the package sub-directory instead of the whole repo. "
         "For repos with multiple packages, this will avoid rebuilds of unchanged packages at the cost of longer generation time."
     )
+    parser.add_argument("--load-fetchers-from-file", help='''
+    Path to file that encodes fetchers with regex matchers. Example content could be
+    [
+    {"regex": "https://github.com/(?P<owner>[^/]*)/(?P<repo>.*?)(.git|/.*)?$", "src_param": "fetchFromGitHub", fetcher": "fetchFromGitHub", "matched_attributes": ["owner", "repo"], "retrieved_attributes": ["rev", "sha256"], "fixed_attributes" : {}, "support_sparse_checkout": True}
+    ]
+    ''')
     parser.add_argument(
         "--patches",
         action=argparse.BooleanOptionalAction,
@@ -464,6 +483,19 @@ def ros2nix(args):
     our_pkg_names: set[str] = set()
     all_dependencies: set[str] = set()
 
+    fetchers = [Fetcher(regex = "https://github.com/(?P<owner>[^/]*)/(?P<repo>.*?)(.git|/.*)?$",
+                            src_param  = "fetchFromGitHub",
+                            fetcher = "fetchFromGitHub",
+                            matched_attributes = [  "owner", "repo"],
+                            retrieved_attributes = [ "rev" , "sha256"],
+                            fixed_attributes = {},
+                            support_sparse_checkout = True,
+                            source_has_name = True
+                        )]
+    if args.load_fetchers_from_file is not None:
+        with open(args.load_fetchers_from_file) as f:
+             fetchers = [Fetcher(**args) for args in json.load(f)]
+
     for source in args.source:
         try:
             with open(source, 'r') as f:
@@ -513,6 +545,7 @@ def ros2nix(args):
                 prefix = check_output("git rev-parse --show-prefix".split())
                 toplevel = check_output("git rev-parse --show-toplevel".split())
                 head = check_output("git rev-parse HEAD".split())
+                ref = subprocess.check_output("git symbolic-ref -q --short HEAD || git describe --tags --exact-match", cwd=srcdir,shell=True).decode().strip()
 
                 def merge_base_to_upstream(commit: str) -> str:
                     return subprocess.check_output(f"git merge-base {commit} $(git for-each-ref refs/remotes/origin --format='%(objectname)')",
@@ -548,34 +581,39 @@ def ros2nix(args):
                         ).decode()
                     )
                     git_cache[cache_key(url, prefix)] = {k : info[k] for k in ["rev", "sha256"]}
+                info["ref"] = ref
+                for fetcher in fetchers:
+                    sparse_checkout = f"""sparseCheckout = ["{prefix}"];
+                            nonConeMode = true;""" if prefix and args.use_per_package_src and fetcher.support_sparse_checkout else ""
+                    match = re.match(fetcher.regex, url)
 
-                match = re.match("https://github.com/(?P<owner>[^/]*)/(?P<repo>.*?)(.git|/.*)?$", url)
-                sparse_checkout = f"""sparseCheckout = ["{prefix}"];
-                        nonConeMode = true;""" if prefix and args.use_per_package_src else ""
-
-                if match is not None:
-                    kwargs["src_param"] = "fetchFromGitHub"
-                    kwargs["src_expr"] = strip_empty_lines(dedent(f'''
-                      fetchFromGitHub {{
-                        owner = "{match["owner"]}";
-                        repo = "{match["repo"]}";
-                        rev = "{info["rev"]}";
-                        sha256 = "{info["sha256"]}";
-                        {sparse_checkout}
-                      }}''')).strip()
-                else:
+                    if match is not None:
+                            kwargs["src_param"] = fetcher.src_param
+                            attributes = (
+                                [f'{k} = "{match[k]}";' for k in fetcher.matched_attributes]
+                                + [f'{k} = "{info[k]}";' for k in fetcher.retrieved_attributes]
+                                + [f'{k} = {json.dumps(v)};' for (k, v) in fetcher.fixed_attributes.items()]
+                            )
+                            kwargs["src_expr"] = strip_empty_lines(dedent(f'''
+                            {fetcher.fetcher} {{
+                            {'\n'.join([""]+attributes)}
+                            {sparse_checkout}
+                            }}''')).strip()
+                            if prefix:
+                                if fetcher.source_has_name:
+                                    kwargs["source_root"] = f"${{src.name}}/{prefix}"
+                                else:
+                                    kwargs["source_root"] = f"source/{prefix}"
+                            break
+                if match is None:
                     kwargs["src_param"] = "fetchgit"
                     kwargs["src_expr"] = strip_empty_lines(dedent(f'''
-                      fetchgit {{
+                    fetchgit {{
                         url = "{url}";
                         rev = "{info["rev"]}";
                         sha256 = "{info["sha256"]}";
                         {sparse_checkout}
-                      }}''')).strip()
-
-                if prefix:
-                    # kwargs["src_expr"] = f'''let fullSrc = {kwargs["src_expr"]}; in "${{fullSrc}}/{prefix}"'''
-                    kwargs["source_root"] = f"${{src.name}}/{prefix}"
+                    }}''')).strip()
 
                 if args.patches:
                     patches = subprocess.check_output(
